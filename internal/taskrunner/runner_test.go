@@ -6,7 +6,10 @@ import (
 )
 
 func TestBuildPrompt_withOpenSpec(t *testing.T) {
-	r := &Runner{config: Config{UseOpenSpec: true}}
+	r := &Runner{
+		config:  Config{UseOpenSpec: true},
+		adapter: newClaudeAdapter(AgentConfig{}),
+	}
 	task := Task{Name: "add-auth", Description: "the plan"}
 	prompt := r.buildPrompt(task)
 	if !strings.Contains(prompt, "/opsx:apply add-auth") {
@@ -15,7 +18,10 @@ func TestBuildPrompt_withOpenSpec(t *testing.T) {
 }
 
 func TestBuildPrompt_withoutOpenSpec(t *testing.T) {
-	r := &Runner{config: Config{UseOpenSpec: false}}
+	r := &Runner{
+		config:  Config{UseOpenSpec: false},
+		adapter: newClaudeAdapter(AgentConfig{}),
+	}
 	task := Task{Name: "add-auth", Description: "the plan"}
 	prompt := r.buildPrompt(task)
 	if !strings.Contains(prompt, "the plan") {

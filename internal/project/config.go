@@ -10,6 +10,12 @@ import (
 
 const configFile = ".devpilot.yaml"
 
+// AgentConfig defines a named CLI agent with an optional model override.
+type AgentConfig struct {
+	Name  string `yaml:"name"`
+	Model string `yaml:"model,omitempty"`
+}
+
 // SkillEntry records an installed skill in the project config.
 type SkillEntry struct {
 	Name        string    `yaml:"name"`
@@ -25,6 +31,7 @@ type Config struct {
 	Models             map[string]string `yaml:"models,omitempty"`
 	OpenSpecMinVersion string            `yaml:"openspecMinVersion,omitempty"`
 	Skills             []SkillEntry      `yaml:"skills,omitempty"`
+	Agents             []AgentConfig     `yaml:"agents,omitempty"`
 }
 
 // ResolveSource returns the effective task source: flag value takes priority,

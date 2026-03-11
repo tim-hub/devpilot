@@ -1,6 +1,7 @@
 package taskrunner
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -77,17 +78,25 @@ func truncate(s string, max int) string {
 	return s[:max] + "..."
 }
 
+// fmtToolCall formats a tool call entry for the tool list.
+func fmtToolCall(icon string, tc toolCallEntry, summaryWidth int) string {
+	return fmt.Sprintf("  %s %-8s %-*s %s",
+		icon, tc.toolName,
+		summaryWidth, truncate(tc.summary, summaryWidth),
+		formatDuration(tc.durationMs),
+	)
+}
+
 const maxTextLines = 2000
 
-// wrapAndSetTextContent wraps each line in m.textLines to m.textContentWidth
-// and sets the result as the text viewport content.
-func (m *TUIModel) wrapAndSetTextContent() {
-	if m.textContentWidth <= 0 {
+// wrapAndSetTextContent wraps text lines to the pane's content width and updates the viewport.
+func (p *agentPaneState) wrapAndSetTextContent() {
+	if p.textContentWidth <= 0 {
 		return
 	}
 	var wrapped []string
-	for _, line := range m.textLines {
-		wrapped = append(wrapped, ansi.Wordwrap(line, m.textContentWidth, ""))
+	for _, line := range p.textLines {
+		wrapped = append(wrapped, ansi.Wordwrap(line, p.textContentWidth, ""))
 	}
-	m.textViewport.SetContent(joinLines(wrapped))
+	p.textViewport.SetContent(joinLines(wrapped))
 }

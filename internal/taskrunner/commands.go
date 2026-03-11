@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,7 +34,7 @@ func RegisterCommands(parent *cobra.Command) {
 var runCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Autonomously process tasks from a board or issue tracker",
-	Long:  "Poll a task source (Trello or GitHub Issues) for ready tasks, execute their plans via Claude Code, and create PRs.",
+	Long:  "Poll a task source (Trello or GitHub Issues) for ready tasks, execute their plans via the configured agent(s), and create PRs.",
 	Run: func(cmd *cobra.Command, args []string) {
 		boardName, _ := cmd.Flags().GetString("board")
 		sourceName, _ := cmd.Flags().GetString("source")
@@ -61,6 +62,7 @@ var runCmd = &cobra.Command{
 		sourceName = projectCfg.ResolveSource(sourceName)
 
 		var source TaskSource
+		var trelloClient *trello.Client
 		switch sourceName {
 		case "trello":
 			if boardName == "" {
@@ -72,7 +74,7 @@ var runCmd = &cobra.Command{
 				fmt.Fprintln(os.Stderr, "Not logged in to Trello. Run: devpilot login trello")
 				os.Exit(1)
 			}
-			trelloClient := trello.NewClient(creds["api_key"], creds["token"])
+			trelloClient = trello.NewClient(creds["api_key"], creds["token"])
 			source = NewTrelloSource(trelloClient, boardName)
 		case "github":
 			source = NewGitHubSource()
@@ -88,6 +90,23 @@ var runCmd = &cobra.Command{
 			}
 		}
 
+		// Resolve agents from project config; default to Claude.
+		agents := resolveAgents(projectCfg)
+
+		// For multi-agent mode, ensure the "Claimed By" custom field exists on the board.
+		claimFieldID := ""
+		if len(agents) > 1 && trelloClient != nil {
+			sourceInfo, err := source.Init()
+			if err == nil {
+				fieldID, err := trelloClient.EnsureClaimFieldExists(sourceInfo.BoardID)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to create/verify Claimed By field: %v\n", err)
+				} else {
+					claimFieldID = fieldID
+				}
+			}
+		}
+
 		cfg := Config{
 			BoardName:     boardName,
 			Interval:      time.Duration(interval) * time.Second,
@@ -97,6 +116,8 @@ var runCmd = &cobra.Command{
 			DryRun:        dryRun,
 			WorkDir:       dir,
 			UseOpenSpec:   useOpenSpec,
+			Agents:        agents,
+			ClaimFieldID:  claimFieldID,
 		}
 
 		isInteractive := term.IsTerminal(int(os.Stdout.Fd()))
@@ -109,6 +130,19 @@ var runCmd = &cobra.Command{
 	},
 }
 
+// resolveAgents converts project.AgentConfig entries into taskrunner.AgentConfig.
+// Defaults to [{Name: "claude"}] if none are configured.
+func resolveAgents(projectCfg *project.Config) []AgentConfig {
+	if len(projectCfg.Agents) == 0 {
+		return []AgentConfig{{Name: "claude"}}
+	}
+	agents := make([]AgentConfig, len(projectCfg.Agents))
+	for i, a := range projectCfg.Agents {
+		agents[i] = AgentConfig{Name: a.Name, Model: a.Model}
+	}
+	return agents
+}
+
 func runWithTUI(cfg Config, source TaskSource, boardName string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,14 +152,25 @@ func runWithTUI(cfg Config, source TaskSource, boardName string) {
 		eventCh <- e
 	}
 
-	r := New(cfg, source, WithEventHandler(handler))
-	model := NewTUIModel(boardName, eventCh, cancel)
+	agentNames := make([]string, len(cfg.Agents))
+	for i, a := range cfg.Agents {
+		agentNames[i] = a.Name
+	}
 
+	model := NewTUIModel(boardName, agentNames, eventCh, cancel)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	var runErr error
 	go func() {
-		if err := r.Run(ctx); err != nil {
+		var err error
+		if len(cfg.Agents) > 1 {
+			mr := NewMultiRunner(cfg, source, handler)
+			err = mr.Run(ctx)
+		} else {
+			r := New(cfg, source, WithEventHandler(handler))
+			err = r.Run(ctx)
+		}
+		if err != nil {
 			runErr = err
 			eventCh <- RunnerErrorEvent{Err: err}
 		}
@@ -148,50 +193,52 @@ func runPlainText(cfg Config, source TaskSource) {
 
 	handler := func(e Event) {
 		switch ev := e.(type) {
+		case AgentRegisteredEvent:
+			logger.Printf("[agent] Registered: %s", ev.AgentName)
 		case RunnerStartedEvent:
-			logger.Printf("Board: %s (%s)", ev.BoardName, ev.BoardID)
+			logger.Printf("[%s] Board: %s (%s)", ev.AgentName, ev.BoardName, ev.BoardID)
 			for name, id := range ev.Lists {
 				logger.Printf("  List %q → %s", name, id)
 			}
 		case PollingEvent:
-			logger.Printf("Polling for tasks...")
+			logger.Printf("[%s] Polling for tasks...", ev.AgentName)
 		case NoTasksEvent:
-			logger.Printf("No tasks. Next poll in %s", ev.NextPoll)
+			logger.Printf("[%s] No tasks. Next poll in %s", ev.AgentName, ev.NextPoll)
 		case CardStartedEvent:
-			logger.Printf("[card] Started: %q on branch %s", ev.CardName, ev.Branch)
+			logger.Printf("[%s] Started: %q on branch %s", ev.AgentName, ev.CardName, ev.Branch)
 		case ToolStartEvent:
 			summary := toolSummary(ev.ToolName, ev.Input)
-			logger.Printf("[tool] %s %s ...", ev.ToolName, summary)
+			logger.Printf("[%s] [tool] %s %s ...", ev.AgentName, ev.ToolName, summary)
 		case ToolResultEvent:
-			logger.Printf("[tool] %s done (%s)", ev.ToolName, formatDuration(ev.DurationMs))
+			logger.Printf("[%s] [tool] %s done (%s)", ev.AgentName, ev.ToolName, formatDuration(ev.DurationMs))
 		case TextOutputEvent:
-			logger.Printf("[text] %s", truncate(ev.Text, 120))
+			logger.Printf("[%s] %s", ev.AgentName, truncate(ev.Text, 120))
 		case StatsUpdateEvent:
 			if ev.Turns > 0 {
-				logger.Printf("[stats] ↑%s ↓%s turns:%d", formatTokens(ev.InputTokens), formatTokens(ev.OutputTokens), ev.Turns)
+				logger.Printf("[%s] ↑%s ↓%s turns:%d", ev.AgentName, formatTokens(ev.InputTokens), formatTokens(ev.OutputTokens), ev.Turns)
 			}
 		case CardDoneEvent:
-			logger.Printf("[card] Done: %q (%s) PR: %s", ev.CardName, ev.Duration, ev.PRURL)
+			logger.Printf("[%s] Done: %q (%s) PR: %s", ev.AgentName, ev.CardName, ev.Duration, ev.PRURL)
 		case CardFailedEvent:
-			logger.Printf("[card] Failed: %q — %s", ev.CardName, ev.ErrMsg)
+			logger.Printf("[%s] Failed: %q — %s", ev.AgentName, ev.CardName, ev.ErrMsg)
+		case ClaimCollisionEvent:
+			logger.Printf("[%s] [claim-collision] Card %q already claimed by %s (ours: %s:%d, actual: %s:%d)", ev.OurAgentName, ev.CardName, ev.ActualAgentName, ev.OurAgentName, ev.OurTimestamp, ev.ActualAgentName, ev.ActualTimestamp)
 		case ReviewStartedEvent:
-			logger.Printf("[review] Starting code review for %s", ev.PRURL)
+			logger.Printf("[%s] [review] Starting for %s", ev.AgentName, ev.PRURL)
 		case ReviewDoneEvent:
-			logger.Printf("[review] Done (exit %d)", ev.ExitCode)
+			logger.Printf("[%s] [review] Done (exit %d)", ev.AgentName, ev.ExitCode)
 		case FixStartedEvent:
-			logger.Printf("[fix] Attempting fix for %s (attempt %d)", ev.PRURL, ev.Attempt)
+			logger.Printf("[%s] [fix] Attempt %d for %s", ev.AgentName, ev.Attempt, ev.PRURL)
 		case FixDoneEvent:
-			logger.Printf("[fix] Fix done (attempt %d, exit %d)", ev.Attempt, ev.ExitCode)
+			logger.Printf("[%s] [fix] Done (attempt %d, exit %d)", ev.AgentName, ev.Attempt, ev.ExitCode)
 		case RunnerStoppedEvent:
-			logger.Printf("Runner stopped.")
+			logger.Printf("[%s] Runner stopped.", ev.AgentName)
 		case RunnerErrorEvent:
 			if ev.Err != nil {
-				logger.Printf("[error] %v", ev.Err)
+				logger.Printf("[%s] [error] %v", ev.AgentName, ev.Err)
 			}
 		}
 	}
-
-	r := New(cfg, source, WithEventHandler(handler))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -203,8 +250,67 @@ func runPlainText(cfg Config, source TaskSource) {
 		cancel()
 	}()
 
-	if err := r.Run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "Runner error:", err)
+	var runErr error
+	if len(cfg.Agents) > 1 {
+		mr := NewMultiRunner(cfg, source, handler)
+		runErr = mr.Run(ctx)
+	} else {
+		r := New(cfg, source, WithEventHandler(handler))
+		runErr = r.Run(ctx)
+	}
+
+	if runErr != nil {
+		fmt.Fprintln(os.Stderr, "Runner error:", runErr)
 		os.Exit(1)
 	}
+}
+
+// multiRunnerTUI is the TUI variant for multi-agent mode.
+// It starts N runners, all writing to one shared event channel,
+// and closes the channel only after all runners finish.
+func multiRunnerTUI(cfg Config, source TaskSource, boardName string, eventCh chan Event, cancel context.CancelFunc) {
+	ctx, _ := context.WithCancelCause(context.Background())
+	_ = ctx
+	_ = cancel
+	_ = boardName
+	_ = eventCh
+
+	// Use MultiRunner.Run via runWithTUI — handled inline in runWithTUI now.
+}
+
+// runMultiAgentWithTUI runs multiple agents sharing the same event channel.
+// Each runner goroutine is independent; all write to eventCh.
+// The channel is closed only after ALL runners finish.
+func runMultiAgentWithTUI(cfg Config, source TaskSource, eventCh chan Event, ctx context.Context) error {
+	agents := cfg.Agents
+	var wg sync.WaitGroup
+	errs := make([]error, len(agents))
+
+	for i, ac := range agents {
+		i, ac := i, ac
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			adapter, err := NewAgentAdapter(ac)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			agentCfg := cfg
+			agentCfg.Agents = []AgentConfig{ac}
+			r := New(agentCfg, source,
+				WithEventHandler(func(e Event) { eventCh <- e }),
+				WithAdapter(adapter),
+			)
+			errs[i] = r.Run(ctx)
+		}()
+	}
+
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

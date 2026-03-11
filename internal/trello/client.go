@@ -228,3 +228,91 @@ func (c *Client) FindListByName(boardID, name string) (*List, error) {
 	}
 	return nil, fmt.Errorf("list not found: %s", name)
 }
+
+// EnsureClaimFieldExists creates the "Claimed By" custom field on a board if it doesn't exist.
+// Returns the field ID if successful or the existing field ID if it already exists.
+// Returns an error only if field creation fails for reasons other than it already existing.
+func (c *Client) EnsureClaimFieldExists(boardID string) (string, error) {
+	fieldName := "Claimed By"
+
+	// First, try to get existing custom fields on the board
+	params := url.Values{}
+	data, err := c.get(fmt.Sprintf("/1/boards/%s/customFields", boardID), params)
+	if err == nil {
+		var fields []map[string]interface{}
+		if err := json.Unmarshal(data, &fields); err == nil {
+			for _, field := range fields {
+				if name, ok := field["name"].(string); ok && name == fieldName {
+					if id, ok := field["id"].(string); ok {
+						return id, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Field doesn't exist, create it
+	params = url.Values{
+		"name":     {fieldName},
+		"type":     {"text"},
+		"pos":      {"bottom"},
+		"display":  {"on-back"},
+	}
+	data, err = c.post(fmt.Sprintf("/1/boards/%s/customFields", boardID), params)
+	if err != nil {
+		return "", fmt.Errorf("create custom field: %w", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("parse custom field response: %w", err)
+	}
+
+	if id, ok := result["id"].(string); ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("no field ID in response")
+}
+
+// SetCardClaimValue sets the "Claimed By" custom field on a card.
+// The fieldID should come from EnsureClaimFieldExists.
+// value should be in format: "{agent-name}:{unix-timestamp-ms}"
+func (c *Client) SetCardClaimValue(cardID, fieldID, value string) error {
+	params := url.Values{
+		"value": {value},
+	}
+	_, err := c.put(fmt.Sprintf("/1/cards/%s/customField/%s", cardID, fieldID), params)
+	return err
+}
+
+// GetCardClaimValue retrieves the "Claimed By" custom field value from a card.
+// Returns empty string if the field is not set.
+func (c *Client) GetCardClaimValue(cardID, fieldID string) (string, error) {
+	params := url.Values{}
+	data, err := c.get(fmt.Sprintf("/1/cards/%s", cardID), params)
+	if err != nil {
+		return "", err
+	}
+
+	var card map[string]interface{}
+	if err := json.Unmarshal(data, &card); err != nil {
+		return "", fmt.Errorf("parse card: %w", err)
+	}
+
+	// Look for customFieldData array
+	if customFields, ok := card["customFieldData"].([]interface{}); ok {
+		for _, cf := range customFields {
+			if cfMap, ok := cf.(map[string]interface{}); ok {
+				if cfID, ok := cfMap["idCustomField"].(string); ok && cfID == fieldID {
+					if cfValue, ok := cfMap["value"].(map[string]interface{}); ok {
+						if text, ok := cfValue["text"].(string); ok {
+							return text, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return "", nil
+}

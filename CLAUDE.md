@@ -90,7 +90,7 @@ Cards move through Trello as a state machine: **Ready** -> **In Progress** -> **
 2. Sorts cards by priority (P0 > P1 > P2 labels; default P2)
 3. Moves card to "In Progress"
 4. Creates branch `task/{cardID}-{slug}` from main
-5. Executes plan via `claude -p` with `stream-json` output
+5. Executes plan via the configured agent (default: `claude -p`) with `stream-json` output
 6. Pushes branch, creates PR via `gh`
 7. Optionally runs automated code review via a second `claude -p` invocation
 8. Auto-merges PR (`gh pr merge --squash --auto`)
@@ -107,16 +107,32 @@ When OpenSpec is installed and `openspec/changes/` exists:
 - Runner auto-detects OpenSpec and uses `/opsx:apply <change-name>` instead of raw plan text
 - Supports resumability: interrupted tasks pick up from last unchecked task
 
+### Multi-Agent Configuration
+
+Configure multiple agents in `.devpilot.yaml` to process tasks in parallel:
+
+```yaml
+agents:
+  - name: claude           # Uses Claude Code (default)
+  - name: gemini           # Uses Gemini CLI (gemini binary required)
+  - name: opencode         # Uses Opencode (opencode binary required)
+  - name: cursor           # Uses Cursor Agent (cursor-agent binary required)
+```
+
+- Each agent runs independently in a separate goroutine, polling the same board
+- Trello's "move to In Progress" acts as a distributed lock — agents claim different cards
+- Omitting `agents` defaults to a single Claude agent (backward compatible)
+- Agent binaries must be in PATH; missing agents fail at startup with a clear error
+
 ### TUI Dashboard
 
 When `devpilot run` launches in a TTY, it displays a real-time Bubble Tea dashboard:
-- **Header**: Board name, runner phase, token stats
-- **Status & Active**: Trello list states + current card info
-- **Tools & Files**: Tool call history with durations + file access tracking
-- **Claude Output**: Scrollable text output
-- **Footer**: Completed task history + errors
+- **Single agent**: Header + status/active card + tools & files + output + footer
+- **Two agents**: Side-by-side column layout with per-agent pane headers
+- **Three+ agents**: Stacked vertical layout with compact per-agent rows
+- **Footer**: Shared completed task history (with `[agentName]` tags in multi-agent mode) + errors
 
-Keyboard: `q`/`Ctrl-C` quit, `Tab` switch pane, `j/k/↑/↓` scroll, `g/G` top/bottom.
+Keyboard: `q`/`Ctrl-C` quit, `Tab` switch pane (single) or agent (multi), `j/k/↑/↓` scroll, `g/G` top/bottom, `1-4` directly select agent pane.
 
 Falls back to plain text mode when not a TTY or `--no-tui` is set.
 
@@ -124,8 +140,9 @@ Falls back to plain text mode when not a TTY or `--no-tui` is set.
 
 The runner uses an event-driven architecture:
 - **Runner** emits lifecycle events (`CardStarted`, `CardDone`, `ToolStart`, `TextOutput`, etc.)
-- **EventBridge** parses `claude -p` stream-json output and translates to runner events
-- **TUI** receives events via buffered channel (size 100) and updates the Bubble Tea model
+- All events carry `AgentName string` for multi-agent routing in the TUI
+- **AgentAdapter** translates each agent's JSON output into unified runner events (one bridge per agent type)
+- **TUI** receives events via buffered channel (size 100) and routes to per-agent `agentPaneState`
 
 ### Skills
 

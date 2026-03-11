@@ -84,6 +84,21 @@ func (s *TrelloSource) MarkFailed(id, comment string) error {
 	return s.client.AddComment(id, comment)
 }
 
+// SetCardClaimValue sets the "Claimed By" custom field on a card for multi-agent coordination.
+func (s *TrelloSource) SetCardClaimValue(cardID, fieldID, value string) error {
+	return s.client.SetCardClaimValue(cardID, fieldID, value)
+}
+
+// GetCardClaimValue retrieves the "Claimed By" custom field value from a card.
+func (s *TrelloSource) GetCardClaimValue(cardID, fieldID string) (string, error) {
+	return s.client.GetCardClaimValue(cardID, fieldID)
+}
+
+// MoveCardToReady moves a card back to the Ready list for re-claiming.
+func (s *TrelloSource) MoveCardToReady(cardID string) error {
+	return s.client.MoveCard(cardID, s.readyListID)
+}
+
 func trelloPriority(c trello.Card) int {
 	names := make([]string, len(c.Labels))
 	for i, l := range c.Labels {

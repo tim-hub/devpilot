@@ -6,6 +6,17 @@ import (
 	"time"
 )
 
+// newTestModel creates a TUIModel for view tests with a single "claude" agent pane.
+func newTestModel(fields TUIModel) TUIModel {
+	pane := newAgentPaneState("claude")
+	fields.agentOrder = []string{"claude"}
+	fields.agentPanes = map[string]*agentPaneState{"claude": pane}
+	if fields.focusedAgent == "" {
+		fields.focusedAgent = "claude"
+	}
+	return fields
+}
+
 func TestViewNotReady(t *testing.T) {
 	m := TUIModel{ready: false, phase: "starting"}
 	output := m.View()
@@ -45,19 +56,19 @@ func TestViewIdle(t *testing.T) {
 }
 
 func TestViewRunning(t *testing.T) {
-	m := TUIModel{
+	m := newTestModel(TUIModel{
 		ready:       true,
 		width:       100,
 		height:      30,
 		phase:       "running",
 		boardName:   "Sprint Board",
 		focusedPane: "tools",
-		activeCard: &cardState{
-			name:    "Fix login bug",
-			branch:  "task/c1-fix-login",
-			status:  "running",
-			started: time.Now().Add(-2 * time.Minute),
-		},
+	})
+	m.agentPanes["claude"].activeCard = &cardState{
+		name:    "Fix login bug",
+		branch:  "task/c1-fix-login",
+		status:  "running",
+		started: time.Now().Add(-2 * time.Minute),
 	}
 	output := m.View()
 	if !strings.Contains(output, "Fix login bug") {
@@ -107,18 +118,18 @@ func TestViewWithError(t *testing.T) {
 }
 
 func TestViewHeaderShowsTokens(t *testing.T) {
-	m := TUIModel{
+	m := newTestModel(TUIModel{
 		ready:       true,
 		width:       100,
 		height:      30,
 		phase:       "running",
 		boardName:   "Sprint Board",
 		focusedPane: "tools",
-		stats: sessionStats{
-			inputTokens:  15000,
-			outputTokens: 3500,
-			turns:        5,
-		},
+	})
+	m.agentPanes["claude"].stats = sessionStats{
+		inputTokens:  15000,
+		outputTokens: 3500,
+		turns:        5,
 	}
 	output := m.View()
 	if !strings.Contains(output, "15k") {
@@ -133,24 +144,24 @@ func TestViewHeaderShowsTokens(t *testing.T) {
 }
 
 func TestViewActiveCardShowsCurrentTool(t *testing.T) {
-	m := TUIModel{
+	m := newTestModel(TUIModel{
 		ready:       true,
 		width:       100,
 		height:      30,
 		phase:       "running",
 		boardName:   "Sprint Board",
 		focusedPane: "tools",
-		activeCard: &cardState{
-			name:    "Fix bug",
-			branch:  "task/c1-fix",
-			status:  "running",
-			started: time.Now(),
-		},
-		activeCall: &toolCallEntry{
-			toolName:   "Read",
-			summary:    "taskrunner/tui.go",
-			durationMs: -1,
-		},
+	})
+	m.agentPanes["claude"].activeCard = &cardState{
+		name:    "Fix bug",
+		branch:  "task/c1-fix",
+		status:  "running",
+		started: time.Now(),
+	}
+	m.agentPanes["claude"].activeCall = &toolCallEntry{
+		toolName:   "Read",
+		summary:    "taskrunner/tui.go",
+		durationMs: -1,
 	}
 	output := m.View()
 	if !strings.Contains(output, "⚡") {

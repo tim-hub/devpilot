@@ -4,19 +4,20 @@
 [![codecov](https://codecov.io/gh/siyuqian/devpilot/branch/main/graph/badge.svg)](https://codecov.io/gh/siyuqian/devpilot)
 [![GitHub Downloads](https://img.shields.io/github/downloads/siyuqian/devpilot/total)](https://github.com/siyuqian/devpilot/releases)
 
-**Autonomous development workflow automation for [Claude Code](https://claude.ai/code).** Write a plan in markdown, push it to Trello, and let DevPilot execute it — creating branches, writing code, opening PRs, running code review, and auto-merging.
+**Autonomous development workflow automation for [Claude Code](https://claude.ai/code) and other AI agents.** Write a plan in markdown, push it to Trello, and let DevPilot execute it using one or more AI agents in parallel — creating branches, writing code, opening PRs, running code review, and auto-merging.
 
 ## How It Works
 
 ```
-Plan (markdown) → devpilot push → Trello card → devpilot run → claude -p → Branch + PR
+Plan (markdown) → devpilot push → Trello card → devpilot run → AI Agent(s) → Branch + PR
 ```
 
 1. **Write a plan** — A markdown file with a `# Title` and implementation steps
 2. **Push to Trello** — `devpilot push plan.md --board "My Board"` creates a card in the "Ready" list
-3. **Runner picks it up** — `devpilot run` polls the board, prioritizes by P0/P1/P2 labels, and executes each plan via `claude -p`
-4. **Watch it work** — A real-time TUI dashboard shows tool calls, Claude output, token stats, and progress
-5. **Ship it** — Branch created, code written, PR opened, AI code review, auto-merge
+3. **Runner picks it up** — `devpilot run` polls the board with one or more agents (configured in `.devpilot.yaml`)
+4. **Agents execute in parallel** — Each agent claims different cards and runs the plan (Trello's "move to In Progress" is the distributed lock)
+5. **Watch it work** — A real-time TUI dashboard adapts to show 1, 2, or 3+ agent panes with per-agent stats and output
+6. **Ship it** — Branches created, code written, PRs opened, AI code review, auto-merge
 
 ## Features
 
@@ -34,12 +35,18 @@ Plan (markdown) → devpilot push → Trello card → devpilot run → claude -p
 
 ### Prerequisites
 
+**Core:**
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
 - A [Trello](https://trello.com/) account with an [API key and token](https://trello.com/power-ups/admin)
 - Git repository initialized in your project
-- *(Optional)* Google OAuth credentials for Gmail integration
-- *(Optional)* Slack OAuth credentials for Slack integration
+
+**Optional:**
+- [Gemini CLI](https://ai.google.dev/gemini-cli/) for multi-agent execution
+- [Opencode](https://github.com/google/opencode) for multi-agent execution
+- [Cursor Agent CLI](https://www.cursor.com/) for multi-agent execution
+- Google OAuth credentials for Gmail integration
+- Slack OAuth credentials for Slack integration
 
 ### Installation
 
@@ -122,6 +129,8 @@ devpilot run --board "Sprint Board"
 | `--dry-run` | `false` | Print actions without executing |
 | `--no-tui` | `false` | Disable TUI dashboard |
 
+**Multi-agent note:** Agents are configured in `.devpilot.yaml` under the `agents:` key (see `.devpilot.yaml` format below). The runner automatically uses `MultiRunner` when multiple agents are configured.
+
 ### `devpilot sync` Flags
 
 | Flag | Default | Description |
@@ -158,6 +167,49 @@ devpilot run --board "Sprint Board"
 | `--channel` | *(required)* | Channel name or user ID for DM |
 | `--message` | | Message text (reads from stdin if omitted) |
 
+## Configuration
+
+### `.devpilot.yaml` Format
+
+```yaml
+# Project name (optional, auto-detected if omitted)
+name: my-project
+
+# Trello board (optional; can be overridden with --board flag)
+board: "Sprint Board"
+
+# Task source: trello or github (default: trello)
+source: trello
+
+# Multi-agent configuration (optional; defaults to ["claude"])
+agents:
+  - name: claude             # Claude Code agent
+    model: claude-opus-4-6   # Optional: Claude model override
+  - name: gemini             # Gemini CLI agent
+  - name: opencode           # Opencode agent
+  - name: cursor             # Cursor Agent CLI
+
+# (Optional) Build and test commands auto-detected by devpilot init
+build: go build -o bin/myapp ./cmd/myapp
+test: go test ./...
+```
+
+**Example: Single agent (backward compatible)**
+
+```yaml
+board: "My Board"
+```
+
+**Example: Multi-agent (parallel execution)**
+
+```yaml
+board: "My Board"
+agents:
+  - name: claude
+  - name: gemini
+  - name: opencode
+```
+
 ## Task Runner Workflow
 
 The runner uses Trello lists as a state machine:
@@ -167,14 +219,14 @@ Ready → In Progress → Done
                     → Failed
 ```
 
-For each card:
+For each card (per agent, in parallel if multiple agents configured):
 1. Polls "Ready" list and sorts by priority (P0 > P1 > P2; default P2)
-2. Validates the card has a description (the plan)
-3. Moves card to "In Progress"
+2. Claims card by moving to "In Progress" (distributed lock across all agents)
+3. Validates the card has a description (the plan)
 4. Creates branch `task/{cardID}-{slug}` from main
-5. Runs `claude -p` with the plan, streaming output via `stream-json`
+5. Runs the configured agent (`claude -p`, `gemini -p`, `opencode run`, etc.) with the plan
 6. Pushes branch and creates a PR via `gh`
-7. Optionally runs automated code review via a second `claude -p` invocation
+7. Optionally runs automated code review via a second agent invocation
 8. Auto-merges PR (`gh pr merge --squash --auto`)
 9. Moves card to "Done" (with PR link) or "Failed" (with error details)
 
@@ -200,6 +252,69 @@ In TTY mode, the runner displays a real-time terminal dashboard:
 
 Keys: `q`/`Ctrl-C` quit, `Tab` switch pane, `j/k/↑/↓` scroll, `g/G` top/bottom.
 
+### Multi-Agent Execution
+
+Run multiple AI agents in parallel to process tasks from the same Trello board. Each agent works independently — Trello's "move to In Progress" acts as a distributed lock, so agents claim different cards automatically.
+
+**Configure agents in `.devpilot.yaml`:**
+
+```yaml
+agents:
+  - name: claude           # Claude Code (default if omitted)
+  - name: gemini           # Gemini CLI
+  - name: opencode         # Opencode
+  - name: cursor           # Cursor Agent CLI
+```
+
+**Example: Run with Claude and Gemini together**
+
+```bash
+# 1. Ensure both Claude Code and Gemini CLI are installed and authenticated
+which claude gemini
+
+# 2. Edit .devpilot.yaml to include both agents
+cat >> .devpilot.yaml << 'EOF'
+agents:
+  - name: claude
+  - name: gemini
+EOF
+
+# 3. Run the task runner — both agents poll in parallel
+devpilot run --board "Sprint Board"
+```
+
+The TUI automatically adapts:
+- **Single agent:** Original dashboard layout (status + tools + files + output)
+- **Two agents:** Side-by-side columns with separate pane headers
+- **Three+ agents:** Stacked vertical rows, one per agent
+
+Each agent has its own:
+- Tool call history and durations
+- Output scrolling (`j/k` or `↑/↓`)
+- Token usage stats
+- File tracking (read/edited)
+
+Keyboard shortcuts in multi-agent mode:
+- `Tab` — cycle through agents
+- `1`, `2`, `3`, `4` — jump directly to agent pane
+- `[Tab]` within an agent — switch between tools and output (single agent only)
+
+**Agent setup:**
+
+| Agent | Command | Install | Notes |
+|-------|---------|---------|-------|
+| Claude | `claude -p --output-format stream-json --allowedTools=*` | [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) | Default; provides `/opsx:apply` skill for OpenSpec |
+| Gemini | `gemini -p --output-format stream-json --yolo` | `curl https://files.genai.google.dev/gemini/install.sh \| bash` | Requires Gemini API key in env |
+| Opencode | `opencode run --format json` | `npm install -g @google/opencode` | Text-only output (step-based JSON) |
+| Cursor | `cursor-agent -p --output-format stream-json --force` | [Cursor Agent](https://www.cursor.com/) | Requires Cursor auth |
+
+**OpenSpec with multiple agents:**
+
+- **Claude:** Automatically uses `/opsx:apply <change-name>` skill (built-in)
+- **Other agents:** Receive raw `proposal.md` + `tasks.md` content injected into the prompt (no skill system)
+
+Both paths support resumability — interrupted tasks pick up from the last unchecked task.
+
 ## Architecture
 
 DevPilot turns **markdown plans into shipped code** by orchestrating three systems: a task queue (Trello), an AI coding agent (`claude -p`), and standard Git/GitHub workflows.
@@ -208,21 +323,29 @@ DevPilot turns **markdown plans into shipped code** by orchestrating three syste
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Runner (orchestrator)                                   │
-│  Polls Trello → manages card lifecycle → emits events    │
+│  MultiRunner (N agents in parallel)                      │
+│  Each agent polls Trello → manages card lifecycle        │
 ├──────────────────────────────────────────────────────────┤
-│  EventBridge (translator)                                │
-│  Parses claude -p stream-json → translates to events     │
+│  Agent Adapters (pluggable per-agent logic)              │
+│  • Claude: claude -p --output-format stream-json         │
+│  • Gemini: gemini -p --output-format stream-json         │
+│  • Opencode: opencode run --format json                  │
+│  • Cursor: cursor-agent -p --output-format stream-json   │
+├──────────────────────────────────────────────────────────┤
+│  Output Bridges (translator per agent)                   │
+│  Parses agent's JSON → translates to unified events      │
 ├──────────────────────────────────────────────────────────┤
 │  TUI / Logger (consumers)                                │
-│  Receives events via channel → renders dashboard / logs  │
+│  Routes events by AgentName → renders multi-pane / logs  │
 └──────────────────────────────────────────────────────────┘
 ```
 
-- **Runner** owns the card state machine and drives the full lifecycle: branch, execute, push, PR, review, merge
-- **Executor** wraps `claude -p --output-format stream-json` for real-time structured output
-- **EventBridge** translates stream-json events into typed runner events (`ToolStart`, `TextOutput`, `TokenUsage`, etc.)
-- **TUI** and **Logger** subscribe via buffered Go channels, decoupling execution from presentation
+- **MultiRunner** spawns N independent Runner goroutines; all poll the same Trello board
+- **Trello as distributed lock:** "move to In Progress" is atomic — only one agent claims each card
+- **Agent Adapters** translate agent-specific invocation logic and output format into a unified interface
+- **Output Bridges** parse each agent's JSON format and emit typed runner events (`ToolStart`, `TextOutput`, etc.)
+- **TUI** routes events by `AgentName` field to per-agent `agentPaneState`, rendering multi-agent dashboard
+- **Logger** prefixes events with `[agentName]` in plain text mode
 
 ## Built-in Skills
 

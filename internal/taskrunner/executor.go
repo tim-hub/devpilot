@@ -35,6 +35,10 @@ type Executor struct {
 	args               []string
 	outputHandler      OutputHandler
 	claudeEventHandler ClaudeEventHandler
+
+	// Adapter-based path (used when adapter is set; takes precedence over command/args).
+	adapter AgentAdapter
+	emit    EventHandler
 }
 
 type ExecutorOption func(*Executor)
@@ -58,6 +62,22 @@ func WithClaudeEventHandler(handler ClaudeEventHandler) ExecutorOption {
 	}
 }
 
+// WithAgentAdapter sets the AgentAdapter used for command building and output parsing.
+// When set, adapter.BuildCommand(prompt) overrides command/args, and adapter.HandleLine
+// replaces the claudeEventHandler path.
+func WithAgentAdapter(adapter AgentAdapter) ExecutorOption {
+	return func(e *Executor) {
+		e.adapter = adapter
+	}
+}
+
+// WithEmitHandler sets the EventHandler that receives runner events from the adapter.
+func WithEmitHandler(emit EventHandler) ExecutorOption {
+	return func(e *Executor) {
+		e.emit = emit
+	}
+}
+
 func NewExecutor(opts ...ExecutorOption) *Executor {
 	e := &Executor{
 		command: "claude",
@@ -70,17 +90,25 @@ func NewExecutor(opts ...ExecutorOption) *Executor {
 }
 
 func (e *Executor) Run(ctx context.Context, prompt string) (*ExecuteResult, error) {
-	args := make([]string, len(e.args))
-	copy(args, e.args)
+	var cmdName string
+	var args []string
 
-	// Only append prompt if using claude (not test commands)
-	if e.command == "claude" {
-		args = append(args, prompt)
+	if e.adapter != nil {
+		// Adapter-based path: adapter provides the full command and args.
+		cmdName, args = e.adapter.BuildCommand(prompt)
+	} else {
+		// Legacy path: use stored command/args, appending prompt for claude.
+		cmdName = e.command
+		args = make([]string, len(e.args))
+		copy(args, e.args)
+		if e.command == "claude" {
+			args = append(args, prompt)
+		}
 	}
 
-	cmd := exec.CommandContext(ctx, e.command, args...)
+	cmd := exec.CommandContext(ctx, cmdName, args...)
 
-	if e.outputHandler == nil && e.claudeEventHandler == nil {
+	if e.outputHandler == nil && e.claudeEventHandler == nil && (e.adapter == nil || e.emit == nil) {
 		return e.runBuffered(ctx, cmd)
 	}
 	return e.runStreaming(ctx, cmd)
@@ -166,7 +194,9 @@ func (e *Executor) scanStream(pipe io.Reader, stream string, buf *bytes.Buffer) 
 		if e.outputHandler != nil {
 			e.outputHandler(OutputLine{Stream: stream, Text: line})
 		}
-		if e.claudeEventHandler != nil && stream == "stdout" {
+		if e.adapter != nil && e.emit != nil && stream == "stdout" {
+			e.adapter.HandleLine(line, e.emit)
+		} else if e.claudeEventHandler != nil && stream == "stdout" {
 			event, err := ParseLine([]byte(line))
 			if err == nil && event != nil {
 				e.claudeEventHandler(event)

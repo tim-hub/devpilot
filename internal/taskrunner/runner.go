@@ -6,19 +6,31 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
 type Config struct {
-	BoardName     string
-	Interval      time.Duration
-	Timeout       time.Duration
-	ReviewTimeout time.Duration // 0 disables code review
-	Once          bool
-	DryRun        bool
-	WorkDir       string
-	UseOpenSpec   bool
+	BoardName      string
+	Interval       time.Duration
+	Timeout        time.Duration
+	ReviewTimeout  time.Duration // 0 disables code review
+	Once           bool
+	DryRun         bool
+	WorkDir        string
+	UseOpenSpec    bool
+	Agents         []AgentConfig // empty defaults to [{Name: "claude"}]
+	ClaimFieldID   string        // Trello custom field ID for task claiming (multi-agent locking)
+}
+
+// agentName returns the single agent name for this config (used when there is exactly one).
+func (c Config) agentName() string {
+	if len(c.Agents) == 1 {
+		return c.Agents[0].Name
+	}
+	return "claude"
 }
 
 type Runner struct {
@@ -29,6 +41,7 @@ type Runner struct {
 	git          *GitOps
 	logger       *log.Logger
 	eventHandler EventHandler
+	adapter      AgentAdapter
 }
 
 // RunnerOption configures a Runner.
@@ -38,6 +51,13 @@ type RunnerOption func(*Runner)
 func WithEventHandler(handler EventHandler) RunnerOption {
 	return func(r *Runner) {
 		r.eventHandler = handler
+	}
+}
+
+// WithAdapter sets a specific AgentAdapter on the runner.
+func WithAdapter(adapter AgentAdapter) RunnerOption {
+	return func(r *Runner) {
+		r.adapter = adapter
 	}
 }
 
@@ -53,16 +73,26 @@ func New(cfg Config, source TaskSource, opts ...RunnerOption) *Runner {
 	}
 
 	// When event handler is set, silence the logger to avoid duplicate output.
-	// All information is conveyed through events instead.
 	if r.eventHandler != nil {
 		r.logger = log.New(io.Discard, "", 0)
 	}
 
-	// When event handler is set, enable streaming output on executor
+	// Default to Claude if no adapter was configured.
+	if r.adapter == nil {
+		agentCfg := AgentConfig{}
+		if len(cfg.Agents) == 1 {
+			agentCfg = cfg.Agents[0]
+		}
+		r.adapter = newClaudeAdapter(agentCfg)
+	}
+
+	// When event handler is set, use adapter-based streaming.
 	var execOpts []ExecutorOption
 	if r.eventHandler != nil {
-		bridge := newEventBridge(r.eventHandler)
-		execOpts = append(execOpts, WithClaudeEventHandler(bridge.Handle))
+		execOpts = append(execOpts,
+			WithAgentAdapter(r.adapter),
+			WithEmitHandler(r.eventHandler),
+		)
 	}
 	r.executor = NewExecutor(execOpts...)
 
@@ -70,6 +100,13 @@ func New(cfg Config, source TaskSource, opts ...RunnerOption) *Runner {
 		r.reviewer = NewReviewer()
 	}
 	return r
+}
+
+func (r *Runner) agentName() string {
+	if r.adapter != nil {
+		return r.adapter.Name()
+	}
+	return "claude"
 }
 
 func (r *Runner) emit(e Event) {
@@ -85,7 +122,7 @@ func (r *Runner) init() error {
 		return err
 	}
 	r.logger.Printf("Connected: %s", info.DisplayName)
-	r.emit(RunnerStartedEvent{BoardName: info.DisplayName, BoardID: info.BoardID, Lists: info.Lists})
+	r.emit(RunnerStartedEvent{BoardName: info.DisplayName, BoardID: info.BoardID, Lists: info.Lists, AgentName: r.agentName()})
 	return nil
 }
 
@@ -109,19 +146,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			r.logger.Println("Shutting down.")
-			r.emit(RunnerStoppedEvent{})
+			r.emit(RunnerStoppedEvent{AgentName: r.agentName()})
 			return nil
 		default:
 		}
 
-		r.emit(PollingEvent{})
+		r.emit(PollingEvent{AgentName: r.agentName()})
 		tasks, err := r.source.FetchReady()
 		if err != nil {
 			r.logger.Printf("Error polling: %v. Retrying in %s...", err, r.config.Interval)
-			r.emit(RunnerErrorEvent{Err: err})
+			r.emit(RunnerErrorEvent{Err: err, AgentName: r.agentName()})
 			if !r.sleep(ctx, r.config.Interval) {
 				r.logger.Println("Shutting down.")
-				r.emit(RunnerStoppedEvent{})
+				r.emit(RunnerStoppedEvent{AgentName: r.agentName()})
 				return nil
 			}
 			continue
@@ -129,10 +166,10 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		if len(tasks) == 0 {
 			r.logger.Printf("No tasks. Sleeping %s...", r.config.Interval)
-			r.emit(NoTasksEvent{NextPoll: r.config.Interval})
+			r.emit(NoTasksEvent{NextPoll: r.config.Interval, AgentName: r.agentName()})
 			if !r.sleep(ctx, r.config.Interval) {
 				r.logger.Println("Shutting down.")
-				r.emit(RunnerStoppedEvent{})
+				r.emit(RunnerStoppedEvent{AgentName: r.agentName()})
 				return nil
 			}
 			continue
@@ -144,7 +181,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		if r.config.Once {
 			r.logger.Println("--once flag set. Exiting.")
-			r.emit(RunnerStoppedEvent{})
+			r.emit(RunnerStoppedEvent{AgentName: r.agentName()})
 			return nil
 		}
 	}
@@ -152,6 +189,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) processCard(ctx context.Context, task Task) {
 	start := time.Now()
+	agentName := r.agentName()
 	r.logger.Printf("Processing card: %q (%s)", task.Name, task.ID)
 
 	if task.Description == "" {
@@ -170,6 +208,15 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 		r.logger.Printf("Failed to move card to In Progress: %v", err)
 	}
 
+	// Claim the card for multi-agent coordination
+	ourClaim := r.claimCard(task)
+
+	// Verify we still own the card before doing irreversible operations
+	if !r.verifyCardOwnership(task, ourClaim) {
+		r.logger.Printf("Lost card ownership due to race condition, skipping to next card")
+		return
+	}
+
 	// Git: checkout main, pull, create branch
 	branch := r.git.BranchName(task.ID, task.Name)
 	if err := r.git.CheckoutMain(); err != nil {
@@ -181,7 +228,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 		r.failCard(task, start, fmt.Sprintf("git create branch: %v", err))
 		return
 	}
-	r.emit(CardStartedEvent{CardID: task.ID, CardName: task.Name, Branch: branch})
+	r.emit(CardStartedEvent{CardID: task.ID, CardName: task.Name, Branch: branch, AgentName: agentName})
 
 	// Build prompt
 	prompt := r.buildPrompt(task)
@@ -193,7 +240,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 	result, err := r.executor.Run(taskCtx, prompt)
 
 	// Save log
-	r.saveLog(task.ID, result)
+	r.saveLog(task.ID, result, ourClaim)
 
 	if err != nil || result.ExitCode != 0 {
 		errMsg := "non-zero exit code"
@@ -207,7 +254,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 		return
 	}
 
-	// Verify claude produced commits before pushing
+	// Verify agent produced commits before pushing
 	hasCommits, err := r.git.HasNewCommits(branch)
 	if err != nil {
 		r.failCard(task, start, fmt.Sprintf("check commits: %v", err))
@@ -215,7 +262,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 		return
 	}
 	if !hasCommits {
-		r.failCard(task, start, "claude produced no commits on task branch")
+		r.failCard(task, start, fmt.Sprintf("%s produced no commits on task branch", agentName))
 		r.git.CheckoutMain()
 		return
 	}
@@ -227,7 +274,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 		return
 	}
 
-	prBody := fmt.Sprintf("## Task\n%s\n\n🤖 Executed by devpilot runner", task.URL)
+	prBody := fmt.Sprintf("## Task\n%s\n\n🤖 Executed by devpilot runner (%s)", task.URL, agentName)
 	prURL, err := r.git.CreatePR(task.Name, prBody)
 	if err != nil {
 		r.failCard(task, start, fmt.Sprintf("create PR: %v", err))
@@ -240,18 +287,18 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 		approved := false
 		for attempt := 0; attempt <= MaxReviewRetries; attempt++ {
 			r.logger.Printf("Running code review for PR: %s (attempt %d)", prURL, attempt+1)
-			r.emit(ReviewStartedEvent{PRURL: prURL})
+			r.emit(ReviewStartedEvent{PRURL: prURL, AgentName: agentName})
 			reviewCtx, reviewCancel := context.WithTimeout(ctx, r.config.ReviewTimeout)
 			reviewResult, reviewErr := r.reviewer.Review(reviewCtx, prURL)
 			reviewCancel()
 
 			if reviewErr != nil {
 				r.logger.Printf("Code review error: %v", reviewErr)
-				r.emit(ReviewDoneEvent{PRURL: prURL, ExitCode: -1})
+				r.emit(ReviewDoneEvent{PRURL: prURL, ExitCode: -1, AgentName: agentName})
 				break
 			}
 
-			r.emit(ReviewDoneEvent{PRURL: prURL, ExitCode: reviewResult.ExitCode})
+			r.emit(ReviewDoneEvent{PRURL: prURL, ExitCode: reviewResult.ExitCode, AgentName: agentName})
 
 			if IsApproved(reviewResult.Stdout) {
 				r.logger.Printf("Code review approved for PR: %s", prURL)
@@ -262,7 +309,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 			// Review found issues — attempt fix if retries remain
 			if attempt < MaxReviewRetries {
 				r.logger.Printf("Review found issues, attempting fix (attempt %d/%d)", attempt+1, MaxReviewRetries)
-				r.emit(FixStartedEvent{PRURL: prURL, Attempt: attempt + 1})
+				r.emit(FixStartedEvent{PRURL: prURL, Attempt: attempt + 1, AgentName: agentName})
 				fixCtx, fixCancel := context.WithTimeout(ctx, r.config.ReviewTimeout)
 				fixResult, fixErr := r.reviewer.Fix(fixCtx, prURL)
 				fixCancel()
@@ -271,7 +318,7 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 				if fixErr == nil {
 					fixExitCode = fixResult.ExitCode
 				}
-				r.emit(FixDoneEvent{PRURL: prURL, Attempt: attempt + 1, ExitCode: fixExitCode})
+				r.emit(FixDoneEvent{PRURL: prURL, Attempt: attempt + 1, ExitCode: fixExitCode, AgentName: agentName})
 
 				if fixErr != nil {
 					r.logger.Printf("Fix attempt failed: %v", fixErr)
@@ -301,8 +348,8 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 
 	// Move to Done
 	duration := time.Since(start).Round(time.Second)
-	r.emit(CardDoneEvent{CardID: task.ID, CardName: task.Name, PRURL: prURL, Duration: duration})
-	comment := fmt.Sprintf("✅ Task completed by devpilot runner\nDuration: %s\nPR: %s", duration, prURL)
+	r.emit(CardDoneEvent{CardID: task.ID, CardName: task.Name, PRURL: prURL, Duration: duration, AgentName: agentName})
+	comment := fmt.Sprintf("✅ Task completed by devpilot runner (%s)\nDuration: %s\nPR: %s", agentName, duration, prURL)
 	r.source.MarkDone(task.ID, comment)
 	r.logger.Printf("Card %q completed in %s. PR: %s", task.Name, duration, prURL)
 
@@ -311,45 +358,98 @@ func (r *Runner) processCard(ctx context.Context, task Task) {
 }
 
 func (r *Runner) buildPrompt(task Task) string {
-	if r.config.UseOpenSpec {
-		return fmt.Sprintf(`Execute the following OpenSpec change autonomously from start to finish. This runs unattended — never stop to ask for feedback, confirmation, or approval.
+	return r.adapter.FormatPrompt(task, r.config.UseOpenSpec, r.config.WorkDir)
+}
 
-Run: /opsx:apply %s
-
-Rules:
-- Execute ALL tasks without stopping
-- Commit after each logical unit of work
-- Never ask for user input or feedback
-- If a task is blocked, skip it and continue with the next task
-- When ALL tasks are complete, push to the current branch`, task.Name)
+func (r *Runner) claimCard(task Task) string {
+	if r.config.ClaimFieldID == "" {
+		return "" // Multi-agent claiming not enabled
 	}
-	return fmt.Sprintf(`Execute the following task plan autonomously from start to finish. This runs unattended — never stop to ask for feedback, confirmation, or approval. Execute ALL steps/batches continuously without pausing.
+	ts, ok := r.source.(*TrelloSource)
+	if !ok {
+		return "" // Not a Trello source, skipping claim
+	}
+	// Format: agent-name:unix-timestamp-ms
+	timestamp := time.Now().UnixMilli()
+	claimValue := fmt.Sprintf("%s:%d", r.agentName(), timestamp)
+	if err := ts.SetCardClaimValue(task.ID, r.config.ClaimFieldID, claimValue); err != nil {
+		r.logger.Printf("Warning: failed to set claim on card %s: %v", task.ID, err)
+		return ""
+	}
+	return claimValue
+}
 
-Use /superpowers:test-driven-development and /superpowers:verification-before-completion skills during execution.
+// verifyCardOwnership re-fetches the card's "Claimed By" field to detect race conditions.
+// Returns true if we own the card (claim matches our claim value).
+// Returns false and moves card back to "Ready" if collision detected (another agent owns it).
+func (r *Runner) verifyCardOwnership(task Task, ourClaim string) bool {
+	if r.config.ClaimFieldID == "" || ourClaim == "" {
+		return true // Claiming not enabled, proceed safely
+	}
+	ts, ok := r.source.(*TrelloSource)
+	if !ok {
+		return true // Not a Trello source, can't verify
+	}
 
-Task: %s
+	// Re-fetch the claim value from Trello
+	currentClaim, err := ts.GetCardClaimValue(task.ID, r.config.ClaimFieldID)
+	if err != nil {
+		r.logger.Printf("Warning: failed to verify card ownership: %v", err)
+		return true // Assume we own it if verification fails (graceful degradation)
+	}
 
-Plan:
-%s
+	// Check if our claim still matches
+	if currentClaim == ourClaim {
+		return true // We still own it
+	}
 
-Rules:
-- Execute ALL steps in the plan without stopping. Do NOT pause between batches or steps for review.
-- Commit after each logical unit of work
-- Never ask for user input or feedback
-- If a step is blocked, skip it and continue with the next step
-- When ALL steps are complete, push to the current branch`, task.Name, task.Description)
+	// Collision detected — another agent claimed it
+	r.logger.Printf("Claim collision detected on card %q: our claim %q, current claim %q", task.ID, ourClaim, currentClaim)
+
+	// Parse claim values to emit detailed event
+	parts := splitClaim(ourClaim)
+	actualParts := splitClaim(currentClaim)
+	r.emit(ClaimCollisionEvent{
+		CardID:          task.ID,
+		CardName:        task.Name,
+		OurAgentName:    parts[0],
+		OurTimestamp:    parts[1],
+		ActualAgentName: actualParts[0],
+		ActualTimestamp: actualParts[1],
+	})
+
+	// Move card back to Ready to allow other agents to claim it
+	if err := ts.MoveCardToReady(task.ID); err != nil {
+		r.logger.Printf("Warning: failed to move card back to Ready after collision: %v", err)
+	}
+
+	return false // We lost the card
+}
+
+// splitClaim parses a claim value "agent-name:timestamp-ms" into [agentName, timestamp].
+// Returns ["unknown", 0] if parsing fails.
+func splitClaim(claim string) [2]interface{} {
+	if claim == "" {
+		return [2]interface{}{"unknown", int64(0)}
+	}
+	var agentName string
+	var timestamp int64
+	if _, err := fmt.Sscanf(claim, "%[^:]:%d", &agentName, &timestamp); err != nil {
+		return [2]interface{}{"unknown", int64(0)}
+	}
+	return [2]interface{}{agentName, timestamp}
 }
 
 func (r *Runner) failCard(task Task, start time.Time, errMsg string) {
 	duration := time.Since(start).Round(time.Second)
-	r.emit(CardFailedEvent{CardID: task.ID, CardName: task.Name, ErrMsg: errMsg, Duration: duration})
+	r.emit(CardFailedEvent{CardID: task.ID, CardName: task.Name, ErrMsg: errMsg, Duration: duration, AgentName: r.agentName()})
 	logPath := filepath.Join(r.config.WorkDir, ".devpilot", "logs", task.ID+".log")
 	comment := fmt.Sprintf("❌ Task failed\nDuration: %s\nError: %s\nSee full log: %s", duration, errMsg, logPath)
 	r.source.MarkFailed(task.ID, comment)
 	r.logger.Printf("Card %q failed: %s", task.Name, errMsg)
 }
 
-func (r *Runner) saveLog(cardID string, result *ExecuteResult) {
+func (r *Runner) saveLog(cardID string, result *ExecuteResult, ourClaim string) {
 	if result == nil {
 		return
 	}
@@ -359,7 +459,16 @@ func (r *Runner) saveLog(cardID string, result *ExecuteResult) {
 		return
 	}
 	logPath := filepath.Join(logDir, cardID+".log")
-	content := fmt.Sprintf("=== STDOUT ===\n%s\n\n=== STDERR ===\n%s\n", result.Stdout, result.Stderr)
+
+	// Build header with metadata
+	header := fmt.Sprintf("=== Execution Log ===\nAgent: %s\nTimestamp: %s\n", r.agentName(), time.Now().Format(time.RFC3339))
+	if ourClaim != "" {
+		parts := splitClaim(ourClaim)
+		header += fmt.Sprintf("Claimed By: %s (timestamp: %d)\n", parts[0], parts[1])
+	}
+	header += "\n=== STDOUT ===\n"
+
+	content := fmt.Sprintf("%s%s\n\n=== STDERR ===\n%s\n", header, result.Stdout, result.Stderr)
 	if err := os.WriteFile(logPath, []byte(content), 0644); err != nil {
 		r.logger.Printf("Failed to write log file %s: %v", logPath, err)
 	}
@@ -371,5 +480,98 @@ func (r *Runner) sleep(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-time.After(d):
 		return true
+	}
+}
+
+// --- MultiRunner ---
+
+// MultiRunner runs N Runners in parallel, one per configured agent.
+// All runners share the same TaskSource; Trello's "move to In Progress"
+// acts as the distributed lock preventing two agents from claiming the same card.
+type MultiRunner struct {
+	cfg     Config
+	source  TaskSource
+	handler EventHandler
+}
+
+// NewMultiRunner creates a MultiRunner for the given config and task source.
+func NewMultiRunner(cfg Config, source TaskSource, handler EventHandler) *MultiRunner {
+	return &MultiRunner{cfg: cfg, source: source, handler: handler}
+}
+
+// Run starts one goroutine per agent and waits for all to finish.
+// Agents claim cards independently; the first to mark In Progress wins.
+func (m *MultiRunner) Run(ctx context.Context) error {
+	agents := m.cfg.Agents
+	if len(agents) == 0 {
+		agents = []AgentConfig{{Name: "claude"}}
+	}
+
+	// Emit registration event for each agent.
+	if m.handler != nil {
+		for _, ac := range agents {
+			m.handler(AgentRegisteredEvent{AgentName: ac.Name})
+		}
+	}
+
+	// Validate all agents are available before starting.
+	for _, ac := range agents {
+		if err := checkAgentAvailable(ac.Name); err != nil {
+			return err
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(agents))
+
+	for i, ac := range agents {
+		i, ac := i, ac // capture loop vars
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			adapter, err := NewAgentAdapter(ac)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			// Each agent gets its own single-agent Config.
+			agentCfg := m.cfg
+			agentCfg.Agents = []AgentConfig{ac}
+
+			r := New(agentCfg, m.source,
+				WithEventHandler(m.handler),
+				WithAdapter(adapter),
+			)
+			errs[i] = r.Run(ctx)
+		}()
+	}
+
+	wg.Wait()
+
+	// Return first non-nil error, if any.
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkAgentAvailable returns an error if the agent binary is not found in PATH.
+func checkAgentAvailable(name string) error {
+	binary := agentBinary(name)
+	if _, err := exec.LookPath(binary); err != nil {
+		return fmt.Errorf("agent %q not found in PATH (expected binary: %s)", name, binary)
+	}
+	return nil
+}
+
+// agentBinary returns the binary name for the given agent name.
+func agentBinary(name string) string {
+	switch name {
+	case "cursor":
+		return "cursor-agent"
+	default:
+		return name
 	}
 }

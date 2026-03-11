@@ -361,6 +361,12 @@ func (r *Runner) buildPrompt(task Task) string {
 	return r.adapter.FormatPrompt(task, r.config.UseOpenSpec, r.config.WorkDir)
 }
 
+// claimCard marks a card as claimed by this agent to prevent other agents from picking it up.
+// This is part of the distributed task locking mechanism for multi-agent coordination.
+// Returns the claim value (format: "agent-name:timestamp-ms") if successful, empty string otherwise.
+// Claim values are used for verification: before branch creation, we re-fetch the claim to ensure
+// we still own the card (detecting race conditions where another agent claimed it first).
+// Gracefully handles missing custom field (returns empty string, continues without locking).
 func (r *Runner) claimCard(task Task) string {
 	if r.config.ClaimFieldID == "" {
 		return "" // Multi-agent claiming not enabled
@@ -380,8 +386,14 @@ func (r *Runner) claimCard(task Task) string {
 }
 
 // verifyCardOwnership re-fetches the card's "Claimed By" field to detect race conditions.
-// Returns true if we own the card (claim matches our claim value).
-// Returns false and moves card back to "Ready" if collision detected (another agent owns it).
+// This implements the verify step of the optimistic locking pattern: claim immediately (claimCard),
+// then verify ownership before irreversible operations (branch creation).
+// Returns true if we still own the card (claim value matches our recorded claim).
+// Returns false if collision detected (another agent's claim value on card):
+//   - Emits ClaimCollisionEvent for observability
+//   - Moves card back to Ready list to allow other agents to process it
+//   - Logs warning but does NOT fail the task (graceful skipping to next card)
+// Handles verification failures gracefully (logs warning, returns true to proceed safely).
 func (r *Runner) verifyCardOwnership(task Task, ourClaim string) bool {
 	if r.config.ClaimFieldID == "" || ourClaim == "" {
 		return true // Claiming not enabled, proceed safely
@@ -426,8 +438,10 @@ func (r *Runner) verifyCardOwnership(task Task, ourClaim string) bool {
 	return false // We lost the card
 }
 
-// splitClaim parses a claim value "agent-name:timestamp-ms" into [agentName, timestamp].
-// Returns ["unknown", 0] if parsing fails.
+// splitClaim parses a claim value "agent-name:timestamp-ms" into a [2]interface{} array.
+// Format: claim values are set by claimCard as "{agent-name}:{unix-timestamp-ms}".
+// Returns [agentName, timestamp] as [interface{}, interface{}] for use in events.
+// Gracefully returns ["unknown", 0] if claim is empty or parsing fails.
 func splitClaim(claim string) [2]interface{} {
 	if claim == "" {
 		return [2]interface{}{"unknown", int64(0)}

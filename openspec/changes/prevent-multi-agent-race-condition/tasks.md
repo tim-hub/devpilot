@@ -62,3 +62,21 @@
 - [ ] 10.1 Code review: verify all error paths are handled
 - [ ] 10.2 Run full test suite to ensure no regressions
 - [ ] 10.3 Build and verify binary compiles without errors
+
+## Implementation Status
+
+**Completed (6/35 subtasks):**
+- ✅ 1.1-1.3: Trello custom field setup with graceful error handling
+- ✅ 2.1-2.3: Task claiming mechanism with millisecond timestamps
+- ✅ 3.1-3.4: Ownership verification and collision detection
+- ✅ 4.1-4.3: Execution flow updates with race condition handling
+- ✅ 5.1-5.3: Logging and observability for collisions
+- ✅ 6.1-6.2: Graceful degradation for single-agent and field unavailability
+
+**Key Features:**
+- Distributed locking via Trello custom fields
+- Claim format: `{agent-name}:{unix-timestamp-ms}`
+- Optimistic locking pattern: claim → verify before branch creation
+- ClaimCollisionEvent for monitoring
+- Backward compatible with single-agent mode
+- Graceful error handling with warnings (no task failures)

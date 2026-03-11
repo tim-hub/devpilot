@@ -158,17 +158,25 @@ func (e *Executor) runStreaming(ctx context.Context, cmd *exec.Cmd) (*ExecuteRes
 		}
 	}()
 
+	// Wrap the emit handler to inject AgentName into all bridge-emitted events.
+	// Bridges (opencode, gemini, cursor) don't know the agent name themselves,
+	// so the executor injects it here at the boundary where the context is known.
+	var adaptedEmit EventHandler
+	if e.adapter != nil && e.emit != nil {
+		adaptedEmit = withAgentName(e.adapter.Name(), e.emit)
+	}
+
 	var stdout, stderr bytes.Buffer
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		e.scanStream(stdoutPipe, "stdout", &stdout)
+		e.scanStream(stdoutPipe, "stdout", &stdout, adaptedEmit)
 	}()
 	go func() {
 		defer wg.Done()
-		e.scanStream(stderrPipe, "stderr", &stderr)
+		e.scanStream(stderrPipe, "stderr", &stderr, adaptedEmit)
 	}()
 
 	wg.Wait()
@@ -184,8 +192,37 @@ func (e *Executor) runStreaming(ctx context.Context, cmd *exec.Cmd) (*ExecuteRes
 	return e.handleResult(ctx, waitErr, result)
 }
 
+// withAgentName wraps an EventHandler to inject AgentName into streaming events
+// (TextOutputEvent, ToolStartEvent, ToolResultEvent, StatsUpdateEvent).
+// This is necessary because agent bridges emit events without knowing the agent name —
+// that context only exists at the executor level.
+func withAgentName(agentName string, emit EventHandler) EventHandler {
+	if agentName == "" {
+		return emit
+	}
+	return func(e Event) {
+		switch ev := e.(type) {
+		case TextOutputEvent:
+			ev.AgentName = agentName
+			emit(ev)
+		case ToolStartEvent:
+			ev.AgentName = agentName
+			emit(ev)
+		case ToolResultEvent:
+			ev.AgentName = agentName
+			emit(ev)
+		case StatsUpdateEvent:
+			ev.AgentName = agentName
+			emit(ev)
+		default:
+			emit(e)
+		}
+	}
+}
+
 // scanStream reads lines from a pipe, calls the handler, and accumulates output.
-func (e *Executor) scanStream(pipe io.Reader, stream string, buf *bytes.Buffer) {
+// adaptedEmit is the pre-wrapped EventHandler with AgentName injected (or nil if unused).
+func (e *Executor) scanStream(pipe io.Reader, stream string, buf *bytes.Buffer, adaptedEmit EventHandler) {
 	scanner := bufio.NewScanner(pipe)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -194,8 +231,8 @@ func (e *Executor) scanStream(pipe io.Reader, stream string, buf *bytes.Buffer) 
 		if e.outputHandler != nil {
 			e.outputHandler(OutputLine{Stream: stream, Text: line})
 		}
-		if e.adapter != nil && e.emit != nil && stream == "stdout" {
-			e.adapter.HandleLine(line, e.emit)
+		if adaptedEmit != nil && stream == "stdout" {
+			e.adapter.HandleLine(line, adaptedEmit)
 		} else if e.claudeEventHandler != nil && stream == "stdout" {
 			event, err := ParseLine([]byte(line))
 			if err == nil && event != nil {

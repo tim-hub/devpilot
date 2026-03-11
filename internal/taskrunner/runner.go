@@ -424,10 +424,10 @@ func (r *Runner) verifyCardOwnership(task Task, ourClaim string) bool {
 	r.emit(ClaimCollisionEvent{
 		CardID:          task.ID,
 		CardName:        task.Name,
-		OurAgentName:    parts[0],
-		OurTimestamp:    parts[1],
-		ActualAgentName: actualParts[0],
-		ActualTimestamp: actualParts[1],
+		OurAgentName:    parts[0].(string),
+		OurTimestamp:    parts[1].(int64),
+		ActualAgentName: actualParts[0].(string),
+		ActualTimestamp: actualParts[1].(int64),
 	})
 
 	// Move card back to Ready to allow other agents to claim it

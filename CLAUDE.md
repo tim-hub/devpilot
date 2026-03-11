@@ -124,6 +124,39 @@ agents:
 - Omitting `agents` defaults to a single Claude agent (backward compatible)
 - Agent binaries must be in PATH; missing agents fail at startup with a clear error
 
+### Distributed Task Locking (Multi-Agent Race Condition Prevention)
+
+When multiple agents process tasks from the same board, a race condition can occur: two agents poll simultaneously, both see the same "Ready" card, and both attempt to claim it. To prevent this, the runner uses **optimistic locking with verification**:
+
+**Claiming Phase:**
+1. Agent moves card to "In Progress" (fast operation, nearly atomic)
+2. Agent immediately sets a "Claimed By" custom field with value `{agent-name}:{unix-timestamp-ms}`
+3. Agent records the claim value for verification
+
+**Verification Phase (before branch creation):**
+1. Agent re-fetches the "Claimed By" field from Trello (slow operation, but safe)
+2. Compares current value with recorded claim value
+3. **If match**: Agent owns the card, proceeds with branch creation
+4. **If mismatch**: Another agent claimed it first:
+   - Emits `ClaimCollisionEvent` for observability/monitoring
+   - Moves card back to "Ready" list for other agents
+   - Skips to next card (no task failure, graceful fallback)
+
+**Custom Field Management:**
+- On first multi-agent run, runner automatically creates "Claimed By" custom field on the board
+- If field creation fails (e.g., Trello API error), runner logs warning and continues without locking (graceful degradation)
+- Single-agent mode skips field creation entirely (backward compatible)
+
+**Observability:**
+- `ClaimCollisionEvent` emitted when collision detected (plain-text: `[agent] [claim-collision] Card 'name' already claimed by other-agent`)
+- Execution logs include claim metadata (agent name, claim timestamp) for audit trail
+
+**Why This Approach:**
+- Simpler than external consensus mechanisms (no Redis, database, or coordination service required)
+- Handles network delays gracefully (claim timestamps allow temporal comparison)
+- Fails safely: missing field doesn't break execution, just loses collision detection
+- Efficient: collision detection happens rarely in practice (few overlapping agents/tasks)
+
 ### TUI Dashboard
 
 When `devpilot run` launches in a TTY, it displays a real-time Bubble Tea dashboard:
